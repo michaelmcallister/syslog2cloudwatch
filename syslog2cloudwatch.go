@@ -2,7 +2,9 @@ package main
 
 import (
     "fmt"
+    "strings"
     "time"
+    "os"
     "gopkg.in/mcuadros/go-syslog.v2"
     "github.com/spf13/viper"
     "github.com/aws/aws-sdk-go/aws"
@@ -13,13 +15,27 @@ import (
 func main() {
     c, err := initConfig()
     if err != nil {
-        fmt.Println("Init error: ", err)
+        fmt.Println("Init error:", err)
+        return
     }
 
-    channel, server := initServer()
+	channel, server, err := initServer()
+	if err != nil {
+        fmt.Println("Server error:", err)
+        return
+    }
+
+
     go func(channel syslog.LogPartsChannel) {
         for logParts := range channel {
-            c.putLog(logParts["message"].(string))
+            syslogMessage := make([]string, 0, len(logParts))
+
+            for key, value := range logParts {
+                message := fmt.Sprintf("%s:%v", key, value)
+                syslogMessage = append(syslogMessage, message)
+            }
+                fmt.Println(syslogMessage)
+                c.putLog(strings.Join(syslogMessage,", "))
         }
     }(channel)
 
@@ -27,12 +43,14 @@ func main() {
 }
 
 type CW struct {
-	svc                    *cloudwatchlogs.CloudWatchLogs
+	svc        *cloudwatchlogs.CloudWatchLogs
 	groupName, streamName  string
 	token      *string
 }
 
 func initConfig() (*CW, error) {
+    os.Setenv("AWS_SDK_LOAD_CONFIG", "1")
+
     userConfig := viper.New()
     userConfig.SetConfigName("app")
     userConfig.AddConfigPath(".")
@@ -41,46 +59,57 @@ func initConfig() (*CW, error) {
     if err != nil {
         return nil, err
     }
+
+    sess, err := session.NewSession()
+    if err!= nil {
+        return nil, err
+    }
     c := &CW{
-            svc:           cloudwatchlogs.New(session.New()),
+            svc:           cloudwatchlogs.New(sess),
             groupName:     userConfig.GetString("loggroup"),
             streamName:    userConfig.GetString("logstream"),
         }
-    c.getToken()
-    return c, nil
+
+    return c, c.getToken()
 }
 
-func initServer() (syslog.LogPartsChannel, *syslog.Server){
+func initServer() (syslog.LogPartsChannel, *syslog.Server, error){
     channel := make(syslog.LogPartsChannel)
     handler := syslog.NewChannelHandler(channel)
     server := syslog.NewServer()
-    server.SetFormat(syslog.RFC5424)
+    server.SetFormat(syslog.RFC3164)
     server.SetHandler(handler)
-    server.ListenUDP("0.0.0.0:514")
-    server.ListenTCP("0.0.0.0:514")
 
-    server.Boot()
-    return channel, server
+    err := server.ListenUDP("0.0.0.0:514")
+	if err != nil {
+        return nil, nil, err
+    }
+
+    err = server.ListenTCP("0.0.0.0:514")
+    if err != nil {
+        return nil, nil, err
+    }
+
+    return channel, server, server.Boot()
 }
 
-func (c *CW) getToken() (int, error) {
+func (c *CW) getToken() (error) {
     resp, err := c.svc.DescribeLogStreams(&cloudwatchlogs.DescribeLogStreamsInput{
         LogGroupName:        aws.String(c.groupName),
         LogStreamNamePrefix: aws.String(c.streamName),
     })
 
     if err != nil {
-        return 1, err
+        return err
     }
 
     if len(resp.LogStreams) > 0 {
         c.token = resp.LogStreams[0].UploadSequenceToken
     }
-    return 0, nil
+    return nil
 }
 
 func (c *CW) putLog(event string) (int, error) {
-        fmt.Println(c.token)
         params := &cloudwatchlogs.PutLogEventsInput{
                 LogEvents: []*cloudwatchlogs.InputLogEvent{
                         {
@@ -95,7 +124,6 @@ func (c *CW) putLog(event string) (int, error) {
         resp, err := c.svc.PutLogEvents(params)
         if err == nil {
             c.token = resp.NextSequenceToken
-            fmt.Println(resp)
         } else {
             fmt.Println(err)
         }
