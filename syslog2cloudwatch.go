@@ -41,6 +41,7 @@ func main() {
 	server.Wait()
 }
 
+//CW type provides a structure for a CloudWatch log entry.
 type CW struct {
 	svc                   *cloudwatchlogs.CloudWatchLogs
 	groupName, streamName string
